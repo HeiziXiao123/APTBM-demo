@@ -2,15 +2,16 @@ function [blocks_rec, block_phase_shift] = aptbm_reconstruct(blocks_rx, cfg, pre
 %APTBM_RECONSTRUCT 进行 APTBM 幅度与相位非线性自重构。
 %
 % 使用方法：blocks_rec = aptbm_reconstruct(blocks_rx, cfg);
-% 获取帧平均块旋转角：[blocks_rec, block_phase_shift] = aptbm_reconstruct(blocks_rx, cfg);
+% 获取统一平均块旋转角：[blocks_rec, block_phase_shift] = aptbm_reconstruct(blocks_rx, cfg);
 %
 % 输入：
-%   blocks_rx  已完成幅度校准的接收块矩阵，每行是 [y_a, y_b]。
+%   blocks_rx  同一工况下全部帧的接收块，按帧顺序拼成 N 行 2 列矩阵。
+%              每行是已完成幅度校准的 [y_a, y_b]。
 %   cfg        仿真参数结构体，提供块能量 P0、公共相位数 M 和权重参数 mu。
 %   previous_shift  仅为兼容旧接口保留，新方法不使用其数值计算相移。
 %
 % 输出：blocks_rec 为重构后的复符号块，尺寸及块排列顺序与输入相同。
-%       block_phase_shift 为仅根据当前帧、按式 (18) 计算的平均块旋转角。
+%       block_phase_shift 为根据全部输入接收块、按式 (18) 计算的一次平均块旋转角。
 %       none 模式输出原接收块，block_phase_shift 为 0。
 %
 % 'self' 依次执行幅度重构和相位重构，'none' 直接返回输入块。
@@ -19,7 +20,8 @@ function [blocks_rec, block_phase_shift] = aptbm_reconstruct(blocks_rx, cfg, pre
 % 当前链路已补偿 IBO 缩放和 PA 小信号增益，因此 P0 取码本块能量。
 % 相位按当前复基带约定使用弧度，以 amplitude*exp(1j*phase) 合成符号。
 % 按单位矢量角平分线建立局部坐标系，展开相位后严格按式 (18) 求均值。
-% 一次调用对应一帧，只计算一次整帧平均块旋转角，不跨帧或跨功率点跟踪。
+% 调用方先汇总同一工况的所有帧，本函数只估计一次旋转角并统一补偿。
+% 不同 PA、输入功率或 SNR 的接收块应分别调用，不混在一起统计。
 % 原去调制圆均值和相位分支跟踪方法完整注释保留在第 4 节。
 
 
@@ -112,7 +114,7 @@ amplitude_rec_a = weights .* amplitude_a + (1 - weights) .* cross_amplitude_a;
 amplitude_rec_b = weights .* cross_amplitude_b + (1 - weights) .* amplitude_b;
 
 
-%% 4. 几何防缠绕展开，并严格按式 (18) 计算当前帧平均块旋转角
+%% 4. 几何防缠绕展开，并按式 (18) 计算全部帧统一的平均块旋转角
 
 % 原方法：消除调制相位，求圆均值，并选择连续的相移分支。
 % 以下旧代码完整注释保留，不参与当前计算。
@@ -143,8 +145,8 @@ amplitude_rec_b = weights .* cross_amplitude_b + (1 - weights) .* amplitude_b;
 % block_phase_shift = wrapped_shift + branch_index * phase_period; % 选择最接近参考的分支。
 
 % 4.1 将两个接收符号归一化后相加，得到角平分线方向。
-ya = blocks_rx(:, 1);                      % 当前帧所有块的第一个接收符号。
-yb = blocks_rx(:, 2);                      % 当前帧所有块的第二个接收符号。
+ya = blocks_rx(:, 1);                      % 全部帧所有块的第一个接收符号。
+yb = blocks_rx(:, 2);                      % 全部帧所有块的第二个接收符号。
 v_mid = ya ./ (abs(ya) + eps) + yb ./ (abs(yb) + eps); % eps 防止除零。
 
 % 4.2 将角平分线的辐角映射到与公共 PSK 状态对应的 [0,2*pi) 区间。
@@ -159,9 +161,9 @@ psi_mid(idx_wrap) = psi_mid(idx_wrap) - 2 * pi;
 psi_ra = psi_mid + angle(ya .* exp(-1j * psi_mid));
 psi_rb = psi_mid + angle(yb .* exp(-1j * psi_mid));
 
-% 4.5 每帧只取一次均值，再减去式 (18) 的理论发送块相位均值。
+% 4.5 对全部帧的全部接收块只取一次均值，再减去式 (18) 的理论期望。
 phi_s_hat = mean(psi_ra + psi_rb) - 2 * pi * (num_phases - 1) / num_phases;
-block_phase_shift = phi_s_hat;             % 返回当前帧的平均块旋转角。
+block_phase_shift = phi_s_hat;             % 这一旋转角用于全部输入接收块的相位补偿。
 
 
 %% 5. 按式 (19) 分配相位补偿，并合成重构后的复符号

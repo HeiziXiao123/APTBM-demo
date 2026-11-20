@@ -13,7 +13,7 @@ function results = check_evm_input_power()
 % 误差使用校准后的连续接收符号；APTBM 还需完成自重构，不做硬判决。
 % 校准只补偿 IBO 缩放及 PA 小信号增益，不额外拟合幅度或公共相位。
 % 无噪声条件下，有限长 RRC 的残余码间干扰和重构估计误差仍会保留。
-% 每帧、每个模型、每个功率点均独立按式 (18) 估计一次平均块旋转角。
+% 每个模型、每个功率点先汇总全部 100 帧，再按式 (18) 估计一次平均块旋转角。
 % 相位按角平分线局部坐标系展开，不使用相位跟踪参考。
 % 输出为 results/evm_input_power.png，重复运行覆盖同名图片。
 
@@ -26,7 +26,7 @@ cfg.rx.reconstruction = 'self';             % APTBM 使用幅度与相位自重�
 pin_dbm_list = -35:1:-5;                    % PA 输入平均功率，单位 dBm。
 model_names = {'rapp', 'saleh'};            % 固定左图 Rapp、右图 Saleh。
 model_titles = {'Rapp', 'Saleh'};           % 子图使用的模型名称。
-num_frames = 50;                          % 每个模型、每个功率点共用这 50 帧数据。
+num_frames = 100;                         % 每个模型、每个功率点共用这 100 帧数据。
 rng(cfg.sim.random_seed);                   % 整次检查只设置一次随机种子。
 
 % 固定为 16 阶设置，并同步更新与比特分组有关的派生参数。
@@ -52,9 +52,20 @@ num_power_points = numel(pin_dbm_list);
 error_energy_aptbm = zeros(num_models, num_power_points); % 自重构后的累计误差能量。
 error_energy_oqam = zeros(num_models, num_power_points);  % OQAM 的累计误差能量。
 ibo_db_list = zeros(num_models, num_power_points); % 各模型、各 Pin 对应的 IBO。
-phase_shift_sum = zeros(num_models, num_power_points); % 累计各帧展开后的块相移。
+block_phase_shift_list = zeros(num_models, num_power_points); % 各工况统一的块旋转角。
 reference_energy_aptbm = 0;                 % 全部发送 APTBM 符号的累计能量。
 reference_energy_oqam = 0;                  % 全部发送 QAM 符号的累计能量。
+
+% 每个单元保存一种 PA、一个 Pin 下的全部帧，不混合不同工况。
+num_blocks_all = num_frames * cfg.sim.blocks_per_frame;
+blocks_tx_all = complex(zeros(num_blocks_all, 2)); % 全部帧的发送块，仅用于 EVM 比较。
+blocks_rx_all = cell(num_models, num_power_points);
+
+for model_index = 1:num_models
+    for power_index = 1:num_power_points
+        blocks_rx_all{model_index, power_index} = complex(zeros(num_blocks_all, 2));
+    end
+end
 
 fprintf('EVM 扫描：Pin = -35:1:-5 dBm，SNR = Inf，每点 %d 帧。\n', num_frames);
 
@@ -64,6 +75,9 @@ fprintf('EVM 扫描：Pin = -35:1:-5 dBm，SNR = Inf，每点 %d 帧。\n', num_
 for frame_index = 1:num_frames
     bits_tx = generate_bits(cfg);           % 每帧只生成一次比特。
     blocks_tx = aptbm_map(bits_tx, codebook);
+    first_block = (frame_index - 1) * cfg.sim.blocks_per_frame + 1;
+    last_block = frame_index * cfg.sim.blocks_per_frame;
+    blocks_tx_all(first_block:last_block, :) = blocks_tx; % 保留原帧顺序。
     symbols_tx_aptbm = serialize_blocks(blocks_tx);
     waveform_tx_aptbm = pulse_shape(symbols_tx_aptbm, rrc_coeffs, cfg);
     symbols_tx_oqam = oqam_map(bits_tx, constellation);
@@ -96,14 +110,12 @@ for frame_index = 1:num_frames
             pa_out_aptbm = apply_pa(pa_in_aptbm, cfg);
             waveform_rx_aptbm = add_awgn(pa_out_aptbm, cfg.channel.snr_db, cfg);
 
-            % 3.2 APTBM：匹配滤波、采样、校准并完成自重构。
+            % 3.2 APTBM：匹配滤波、采样、校准，暂存本帧接收块。
             matched_aptbm = matched_filter(waveform_rx_aptbm, rrc_coeffs);
             symbols_rx_aptbm = sample_symbols(matched_aptbm, rrc_coeffs, cfg);
             calibrated_aptbm = calibrate_gain(symbols_rx_aptbm, scale_aptbm, cfg);
             blocks_rx = deserialize_blocks(calibrated_aptbm);
-            [blocks_rec, block_phase_shift] = aptbm_reconstruct(blocks_rx, cfg);
-            phase_shift_sum(model_index, power_index) = ...
-                phase_shift_sum(model_index, power_index) + block_phase_shift;
+            blocks_rx_all{model_index, power_index}(first_block:last_block, :) = blocks_rx;
 
             % 3.3 OQAM：设置相同输入功率，经过 PA 和无噪声信道。
             [pa_in_oqam, scale_oqam] = set_input_backoff(waveform_tx_oqam, ibo_db, cfg);
@@ -122,11 +134,8 @@ for frame_index = 1:num_frames
                 && abs(power_ratio_oqam - 1) < 1e-10, ...
                 'check_evm_input_power:InputPower', '实际 PA 输入平均功率与目标 Pin 不一致。');
 
-            % 3.6 比较连续接收符号与原发送符号，累计误差能量。
-            error_aptbm = blocks_rec - blocks_tx; % 两列分别对应 a、b 的复数误差。
+            % 3.6 OQAM 逐帧累计误差；APTBM 待全部帧收齐后统一重构再比较。
             error_oqam = calibrated_oqam - symbols_tx_oqam;
-            error_energy_aptbm(model_index, power_index) = ...
-                error_energy_aptbm(model_index, power_index) + sum(abs(error_aptbm(:)).^2);
             error_energy_oqam(model_index, power_index) = ...
                 error_energy_oqam(model_index, power_index) + sum(abs(error_oqam).^2);
         end
@@ -138,7 +147,22 @@ for frame_index = 1:num_frames
 end
 
 
-%% 4. 按论文定义计算 EVM，单位 dB
+%% 4. APTBM 全部帧统一估计一次旋转角，再计算 EVM
+% 每种 PA、每个输入功率点只调用一次重构函数，输入包含全部 100 帧。
+
+for model_index = 1:num_models
+    cfg.pa.model = model_names{model_index};
+
+    for power_index = 1:num_power_points
+        [blocks_rec_all, block_phase_shift] = aptbm_reconstruct( ...
+            blocks_rx_all{model_index, power_index}, cfg);
+        block_phase_shift_list(model_index, power_index) = block_phase_shift;
+        error_aptbm = blocks_rec_all - blocks_tx_all; % 所有帧使用同一个平均旋转角。
+        error_energy_aptbm(model_index, power_index) = sum(abs(error_aptbm(:)).^2);
+    end
+end
+
+% 按论文定义计算 EVM，单位 dB。
 % N*Pavg 等于全部发送符号的能量之和，故可直接用累计能量之比。
 % APTBM 的分子、分母均包括块内两个符号，避免遗漏或重复乘以 2。
 % 先累计线性能量，再取对数，不对各帧的 dB 结果直接求平均。
@@ -171,7 +195,7 @@ for model_index = 1:num_models
     ylim([min_evm_db, max_evm_db]);          % 两幅子图使用相同纵轴范围，便于对比。
 end
 
-sgtitle(sprintf('16-order comparison: SNR = Inf, %d frames per power point', num_frames));
+sgtitle(sprintf('16-order comparison: SNR = Inf, one phase estimate from %d frames/point', num_frames));
 
 
 %% 6. 保存整张图片，并返回统计结果
@@ -199,6 +223,6 @@ results.reference_energy_aptbm = reference_energy_aptbm;
 results.reference_energy_oqam = reference_energy_oqam;
 results.evm_db_aptbm = evm_db_aptbm;
 results.evm_db_oqam = evm_db_oqam;
-results.mean_block_phase_shift = phase_shift_sum / num_frames; % 各点平均块相移，单位弧度。
+results.mean_block_phase_shift = block_phase_shift_list; % 每个点由全部帧估计的一次旋转角。
 
 end
