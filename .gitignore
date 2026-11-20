@@ -1,0 +1,10 @@
+# MATLAB 编辑器备份与运行日志
+*.asv
+*.m~
+*.autosave
+*.log
+matlab_crash_dump*
+
+# 系统生成的目录缓存
+Thumbs.db
+.DS_Store
