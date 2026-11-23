@@ -16,7 +16,8 @@ function symbols_rx = oqam_sample_symbols(waveform_matched, rrc_coeffs, cfg)
 % 默认 I 分支取第 41、45、...、8037 点的实部，
 %      Q 分支取第 43、47、...、8039 点的虚部，再按 I+1j*Q 合成。
 % 采样后仍保留当前幅度标度、非线性失真、噪声及有限长滤波的残余干扰。
-% 后续依次调用 calibrate_gain.m 和 oqam_demap.m。
+% MP 模型应先对连续匹配滤波波形调用 calibrate_gain.m，再传入本函数采样。
+% 原有正实数增益模型可在采样后校准，最后调用 oqam_demap.m。
 
 
 %% 1. 检查输入，并读取采样参数

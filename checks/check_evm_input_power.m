@@ -4,7 +4,7 @@ function results = check_evm_input_power()
 % 使用方法：在工程根目录先执行 startup，再执行 check_evm_input_power。
 % 也可以使用 results = check_evm_input_power(); 获取累计统计结果。
 %
-% 左图为 Rapp，右图为 Saleh，每图只显示 OQAM 和 APTBM 自重构两条曲线。
+% 从左到右为 Rapp、Saleh、MP，每图显示 OQAM 和 APTBM 自重构两条曲线。
 % 输入平均功率 Pin 扫描 -35:1:-5 dBm，SNR=Inf，不加入 AWGN。
 % APTBM 使用 16×16 码本，OQAM 使用 16-QAM，两者每符号周期均传输 4 比特。
 %
@@ -12,6 +12,9 @@ function results = check_evm_input_power()
 % abs(y-x)^2 等于 I/Q 两维误差平方之和，APTBM 每块的两个符号均计入。
 % 误差使用校准后的连续接收符号；APTBM 还需完成自重构，不做硬判决。
 % 校准只补偿 IBO 缩放及 PA 小信号增益，不额外拟合幅度或公共相位。
+% MP 的 OQAM 接收端先校准匹配滤波后的连续复波形，再进行 I/Q 分时采样。
+% 静态复增益校准后，MP 的频率相关记忆失真及初始瞬态继续保留。
+% Pin 按进入 apply_pa 的完整波形定义，MP 内部限幅由 cfg.pa.mp.clip_input 控制。
 % 无噪声条件下，有限长 RRC 的残余码间干扰和重构估计误差仍会保留。
 % 每个模型、每个功率点先汇总全部 100 帧，再按式 (18) 估计一次平均块旋转角。
 % 相位按角平分线局部坐标系展开，不使用相位跟踪参考。
@@ -24,8 +27,8 @@ cfg = comparison_config();                  % 读取两种调制共用的配置�
 cfg.channel.snr_db = Inf;                   % 关闭 AWGN，只观察无噪声链路误差。
 cfg.rx.reconstruction = 'self';             % APTBM 使用幅度与相位自重构。
 pin_dbm_list = -35:1:-5;                    % PA 输入平均功率，单位 dBm。
-model_names = {'rapp', 'saleh'};            % 固定左图 Rapp、右图 Saleh。
-model_titles = {'Rapp', 'Saleh'};           % 子图使用的模型名称。
+model_names = {'rapp', 'saleh', 'mp'};      % 三个子图依次对应 Rapp、Saleh、MP。
+model_titles = {'Rapp', 'Saleh', 'MP'};     % 子图使用的模型名称。
 num_frames = 100;                         % 每个模型、每个功率点共用这 100 帧数据。
 rng(cfg.sim.random_seed);                   % 整次检查只设置一次随机种子。
 
@@ -90,10 +93,15 @@ for frame_index = 1:num_frames
     for model_index = 1:num_models
         cfg.pa.model = model_names{model_index}; % 切换当前非线性 PA 模型。
 
-        if strcmp(cfg.pa.model, 'rapp')
-            reference_input_power = cfg.pa.rapp.reference_input_power;
-        else
-            reference_input_power = cfg.pa.saleh.reference_input_power;
+        switch cfg.pa.model
+            case 'rapp'
+                reference_input_power = cfg.pa.rapp.reference_input_power;
+
+            case 'saleh'
+                reference_input_power = cfg.pa.saleh.reference_input_power;
+
+            case 'mp'
+                reference_input_power = cfg.pa.mp.reference_input_power;
         end
 
         for power_index = 1:num_power_points
@@ -122,10 +130,18 @@ for frame_index = 1:num_frames
             pa_out_oqam = apply_pa(pa_in_oqam, cfg);
             waveform_rx_oqam = add_awgn(pa_out_oqam, cfg.channel.snr_db, cfg);
 
-            % 3.4 OQAM：匹配滤波、I/Q 分时采样及幅度校准。
+            % 3.4 OQAM：MP 必须先校准连续复波形，再分别取 I/Q 采样值。
             matched_oqam = matched_filter(waveform_rx_oqam, rrc_coeffs);
-            symbols_rx_oqam = oqam_sample_symbols(matched_oqam, rrc_coeffs, cfg);
-            calibrated_oqam = calibrate_gain(symbols_rx_oqam, scale_oqam, cfg);
+
+            if strcmp(cfg.pa.model, 'mp')
+                % 复数相位校准会旋转 I/Q 轴，应在分时取实部、虚部之前完成。
+                matched_calibrated_oqam = calibrate_gain(matched_oqam, scale_oqam, cfg);
+                calibrated_oqam = oqam_sample_symbols(matched_calibrated_oqam, rrc_coeffs, cfg);
+            else
+                % 原有模型使用正实数增益，继续沿用先采样、后幅度校准的顺序。
+                symbols_rx_oqam = oqam_sample_symbols(matched_oqam, rrc_coeffs, cfg);
+                calibrated_oqam = calibrate_gain(symbols_rx_oqam, scale_oqam, cfg);
+            end
 
             % 3.5 核对实际输入功率，平均时包含完整成形波形的滤波尾部。
             power_ratio_aptbm = mean(abs(pa_in_aptbm).^2) / target_input_power;
@@ -173,13 +189,13 @@ min_evm_db = 5 * floor(min([evm_db_aptbm(:); evm_db_oqam(:)]) / 5);
 max_evm_db = 5 * ceil(max([evm_db_aptbm(:); evm_db_oqam(:)]) / 5);
 
 
-%% 5. 绘制左 Rapp、右 Saleh 的 EVM-输入功率曲线
+%% 5. 绘制 Rapp、Saleh、MP 的 EVM-输入功率曲线
 
 figure_handle = figure('Name', 'EVM versus PA Input Power', ...
-    'NumberTitle', 'off', 'Color', 'w', 'Position', [100, 100, 1200, 500]);
+    'NumberTitle', 'off', 'Color', 'w', 'Position', [50, 100, 1650, 500]);
 
 for model_index = 1:num_models
-    subplot(1, 2, model_index);
+    subplot(1, num_models, model_index);
     plot(pin_dbm_list, evm_db_aptbm(model_index, :), 'b-o', ...
         'LineWidth', 1.5, 'DisplayName', 'APTBM (16 x 16, reconstructed)');
     hold on;
@@ -192,7 +208,7 @@ for model_index = 1:num_models
     title([model_titles{model_index}, ' PA']);
     legend('Location', 'northwest');
     xlim([pin_dbm_list(1), pin_dbm_list(end)]);
-    ylim([min_evm_db, max_evm_db]);          % 两幅子图使用相同纵轴范围，便于对比。
+    ylim([min_evm_db, max_evm_db]);          % 三幅子图使用相同纵轴范围，便于对比。
 end
 
 sgtitle(sprintf('16-order comparison: SNR = Inf, one phase estimate from %d frames/point', num_frames));
@@ -208,7 +224,7 @@ if ~isfolder(results_dir)
 end
 
 image_file = fullfile(results_dir, 'evm_input_power.png');
-print(figure_handle, image_file, '-dpng', '-r150'); % 两个子图合为一张 PNG 保存。
+print(figure_handle, image_file, '-dpng', '-r150'); % 三个子图合为一张 PNG 保存。
 fprintf('EVM-输入功率对比图已保存至：\n%s\n', image_file);
 
 results = struct();

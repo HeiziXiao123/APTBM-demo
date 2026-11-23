@@ -28,11 +28,14 @@ switch cfg.pa.model
     case 'saleh'
         reference_input_power = cfg.pa.saleh.reference_input_power; % Saleh 的参考功率。
 
+    case 'mp'
+        reference_input_power = cfg.pa.mp.reference_input_power; % MP 的参考功率。
+
     case 'linear'
         reference_input_power = 1;            % 理想单位增益旁路使用归一化参考功率 1。
 
     otherwise
-        error('set_input_backoff:Model', 'PA 模型必须为 rapp、saleh 或 linear。');
+        error('set_input_backoff:Model', 'PA 模型必须为 rapp、saleh、mp 或 linear。');
 end
 
 if ~iscolumn(waveform_tx) || isempty(waveform_tx)

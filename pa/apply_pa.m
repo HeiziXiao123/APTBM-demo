@@ -1,16 +1,18 @@
 function waveform_pa_out = apply_pa(waveform_pa_in, cfg)
-%APPLY_PA 按指定模型计算 PA 的 AM-AM 和 AM-PM 非线性响应。
+%APPLY_PA 按指定模型计算 PA 的无记忆或记忆多项式响应。
 %
 % 使用方法：waveform_pa_out = apply_pa(waveform_pa_in, cfg);
 %
 % 输入：
 %   waveform_pa_in  由 set_input_backoff.m 调整幅度后的 PA 输入波形列向量。
-%   cfg             仿真参数结构体，模型参数分别存放在 cfg.pa.rapp 和 cfg.pa.saleh。
+%   cfg             仿真参数结构体，参数按 rapp、saleh、mp 模型分组存放。
 %
 % 输出：waveform_pa_out 为 PA 输出复波形，尺寸与输入相同。
 %
 % cfg.pa.model 为 'rapp' 时使用论文式 (20)，为 'saleh' 时使用式 (21)。
 % 两种模型均逐采样点计算幅度压缩和相位偏移，属于无记忆模型。
+% 'mp' 使用因果记忆多项式，按阶数和延迟抽头累加复数输出。
+% MP 可按配置保持相位限幅；每次调用以零初始记忆开始，输出与输入等长。
 % 'linear' 表示单位增益理想旁路，直接返回输入波形。
 %
 % 单位：Rapp 的 alpha0=2560 对应度制相位偏移，计算后转为弧度。
@@ -32,7 +34,7 @@ amplitude_in = abs(waveform_pa_in);            % 提取每个输入采样点的�
 phase_in = angle(waveform_pa_in);              % 提取输入相位，单位为弧度。
 
 
-%% 2. 按当前模型计算输出幅度和附加相位
+%% 2. 按当前模型计算 PA 响应
 
 switch cfg.pa.model
     case 'rapp'
@@ -71,12 +73,74 @@ switch cfg.pa.model
         % AM-PM：Saleh 公式给出的附加相位单位为弧度。
         phase_shift = alpha2 * input_power ./ (1 + beta2 * input_power);
 
+    case 'mp'
+        % 读取 MP 参数：系数矩阵的行对应阶数，列对应延迟抽头。
+        orders = cfg.pa.mp.orders;
+        coeffs = cfg.pa.mp.coeffs;
+        memory_depth = cfg.pa.mp.memory_depth; % 抽头数 L，延迟为 0 到 L-1。
+
+        if ~isscalar(memory_depth) || ~isreal(memory_depth) ...
+                || ~isfinite(memory_depth) || memory_depth < 1 ...
+                || mod(memory_depth, 1) ~= 0
+            error('apply_pa:MemoryDepth', 'MP 记忆抽头数必须为正整数。');
+        end
+
+        if ~isvector(orders) || isempty(orders) || ~isreal(orders) ...
+                || ~all(isfinite(orders(:))) || any(orders(:) < 1) ...
+                || any(mod(orders(:), 2) ~= 1)
+            error('apply_pa:Orders', 'MP 多项式阶数必须为非空的正奇数向量。');
+        end
+
+        if ~ismatrix(coeffs) || size(coeffs, 1) ~= numel(orders) ...
+                || size(coeffs, 2) ~= memory_depth
+            error('apply_pa:CoefficientsShape', 'MP 系数矩阵的行数须等于阶数数量，列数须等于记忆抽头数。');
+        end
+
+        if ~all(isfinite(coeffs(:)))
+            error('apply_pa:CoefficientsValue', 'MP 系数必须只包含有限数值。');
+        end
+
+        % 先保护多项式的输入幅度，限幅时保持每个采样点的原始相位。
+        x = waveform_pa_in;                 % 保留输入列向量，按配置对副本限幅。
+
+        if cfg.pa.mp.clip_input
+            max_input_amplitude = cfg.pa.mp.max_input_amplitude;
+
+            if ~isscalar(max_input_amplitude) || ~isreal(max_input_amplitude) ...
+                    || ~isfinite(max_input_amplitude) || max_input_amplitude <= 0
+                error('apply_pa:MaxInputAmplitude', 'MP 输入幅度限幅上限必须为有限的正实数。');
+            end
+
+            idx_clip = amplitude_in > max_input_amplitude; % 仅处理超过上限的采样点。
+            x(idx_clip) = max_input_amplitude * exp(1j * phase_in(idx_clip));
+        end
+
+        % 头部补 L-1 个零，实现输入开始前 x(n)=0 的因果边界条件。
+        num_samples = numel(x);
+        x_padded = [zeros(memory_depth - 1, 1); x];
+        waveform_pa_out = complex(zeros(num_samples, 1)); % 为 N 个输出采样点分配空间。
+
+        for l_idx = 1:memory_depth
+            delay = l_idx - 1;             % 系数第 l_idx 列对应的实际延迟。
+            first_sample = memory_depth - delay; % n=1 时延迟输入在补零向量中的位置。
+            last_sample = first_sample + num_samples - 1;
+            x_delayed = x_padded(first_sample:last_sample); % 整帧的 x(n-delay) 列向量。
+
+            for k_idx = 1:numel(orders)
+                order = orders(k_idx);     % 当前阶数，例如 1、3、5。
+                polynomial_term = x_delayed .* (abs(x_delayed) .^ (order - 1));
+                waveform_pa_out = waveform_pa_out + coeffs(k_idx, l_idx) .* polynomial_term;
+            end
+        end
+
+        return;                             % MP 已得到复输出，直接返回，避免进入无记忆模型合成。
+
     case 'linear'
         waveform_pa_out = waveform_pa_in;     % 理想旁路保留输入的每个复数采样点。
         return;                              % 直接结束，不进行非线性变换。
 
     otherwise
-        error('apply_pa:Model', 'PA 模型必须为 rapp、saleh 或 linear。');
+        error('apply_pa:Model', 'PA 模型必须为 rapp、saleh、mp 或 linear。');
 end
 
 
